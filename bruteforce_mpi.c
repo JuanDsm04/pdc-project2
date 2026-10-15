@@ -1,6 +1,6 @@
 //bruteforce_mpi.c
-//uso mpirun -np N ./bruteforce_mpi <modo> <cifrado.bin> <palabra> [bits]
-//modos seq, naive
+//uso mpirun -np N ./bruteforce_mpi <modo> <cifrado.bin> <palabra> [bits] [bloque]
+//modos seq, naive, stride, blocks, dynamic
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -43,6 +43,51 @@ static int buscarNaive(Ctx *c, int id, int N, long upper, long *key){
   return 0;
 }
 
+//el proceso id prueba id, id+N, id+2N, ...
+static int buscarStride(Ctx *c, int id, int N, long upper, long *key){
+  for(long i = id; i < upper; i += N){
+    int r = paso(c, i);
+    if(r == 1){ *key = i; return 1; }
+    if(r == 2) return 0;
+  }
+  return 0;
+}
+
+//bloques de tamanio fijo repartidos ciclicamente, el proceso id toma los bloques id, id+N, ...
+static int buscarBlocks(Ctx *c, int id, int N, long upper, long block, long *key){
+  for(long start = id * block; start < upper; start += N * block){
+    long end = start + block < upper ? start + block : upper;
+    for(long i = start; i < end; ++i){
+      int r = paso(c, i);
+      if(r == 1){ *key = i; return 1; }
+      if(r == 2) return 0;
+    }
+  }
+  return 0;
+}
+
+//cada proceso pide el siguiente bloque a un contador compartido en el proceso 0
+static int buscarDynamic(Ctx *c, MPI_Win win, long upper, long block, long *key){
+  int hit = 0, done = 0;
+  long one = 1;
+  MPI_Win_lock_all(0, win);
+  while(!done){
+    long b;
+    MPI_Fetch_and_op(&one, &b, MPI_LONG, 0, 0, MPI_SUM, win);
+    MPI_Win_flush(0, win);
+    long start = b * block;
+    if(start >= upper) break;
+    long end = start + block < upper ? start + block : upper;
+    for(long i = start; i < end; ++i){
+      int r = paso(c, i);
+      if(r == 1){ *key = i; hit = 1; done = 1; break; }
+      if(r == 2){ done = 1; break; }
+    }
+  }
+  MPI_Win_unlock_all(win);
+  return hit;
+}
+
 int main(int argc, char *argv[]){
   MPI_Init(&argc, &argv);
   int N, id;
@@ -51,20 +96,23 @@ int main(int argc, char *argv[]){
 
   //programacion defensiva, todos los procesos validan igual y salen juntos
   int bits = 56;
+  long block = 1L << 16;
   int err = 0;
-  if(argc < 4 || argc > 5){
+  if(argc < 4 || argc > 6){
     err = 1;
   }else{
-    if(argc == 5) bits = atoi(argv[4]);
-    if(bits < 1 || bits > 56) err = 1;
+    if(argc >= 5) bits = atoi(argv[4]);
+    if(argc == 6) block = atol(argv[5]);
+    if(bits < 1 || bits > 56 || block < 1) err = 1;
     if(strcmp(argv[1], "seq") == 0 && N != 1) err = 2;
-    else if(strcmp(argv[1], "naive") && strcmp(argv[1], "seq")) err = 1;
+    else if(strcmp(argv[1], "naive") && strcmp(argv[1], "seq") && strcmp(argv[1], "stride")
+            && strcmp(argv[1], "blocks") && strcmp(argv[1], "dynamic")) err = 1;
     if(strlen(argv[3]) == 0) err = 1;
   }
   if(err){
     if(id == 0){
       if(err == 2) fprintf(stderr, "el modo seq se ejecuta con -np 1\n");
-      else fprintf(stderr, "uso mpirun -np N %s <seq|naive> <cifrado.bin> <palabra> [bits 1-56]\n", argv[0]);
+      else fprintf(stderr, "uso mpirun -np N %s <seq|naive|stride|blocks|dynamic> <cifrado.bin> <palabra> [bits 1-56] [bloque]\n", argv[0]);
     }
     MPI_Finalize();
     return 1;
@@ -96,6 +144,18 @@ int main(int argc, char *argv[]){
   long key = 0;
   long recv = 0;
 
+  //el contador de bloques se crea antes del Irecv para que no interfiera con los avisos
+  long *counter = NULL;
+  MPI_Win win = MPI_WIN_NULL;
+  if(strcmp(modo, "dynamic") == 0){
+    MPI_Win_allocate(id == 0 ? sizeof(long) : 0, sizeof(long), MPI_INFO_NULL, MPI_COMM_WORLD, &counter, &win);
+    if(id == 0){
+      MPI_Win_lock(MPI_LOCK_EXCLUSIVE, 0, 0, win);
+      *counter = 0;
+      MPI_Win_unlock(0, win);
+    }
+  }
+
   //los avisos de llave encontrada viajan en un comunicador propio
   MPI_Comm stopComm;
   MPI_Comm_dup(MPI_COMM_WORLD, &stopComm);
@@ -103,7 +163,11 @@ int main(int argc, char *argv[]){
   MPI_Barrier(MPI_COMM_WORLD);
   double t0 = MPI_Wtime();
 
-  int hit = buscarNaive(&c, id, N, upper, &key);
+  int hit;
+  if(strcmp(modo, "stride") == 0) hit = buscarStride(&c, id, N, upper, &key);
+  else if(strcmp(modo, "blocks") == 0) hit = buscarBlocks(&c, id, N, upper, block, &key);
+  else if(strcmp(modo, "dynamic") == 0) hit = buscarDynamic(&c, win, upper, block, &key);
+  else hit = buscarNaive(&c, id, N, upper, &key);
 
   if(hit){
     for(int node = 0; node < N; node++){
@@ -149,6 +213,7 @@ int main(int argc, char *argv[]){
     free(all);
   }
 
+  if(win != MPI_WIN_NULL) MPI_Win_free(&win);
   MPI_Comm_free(&stopComm);
   free(c.tmp);
   free(ciph);
